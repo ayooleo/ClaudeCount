@@ -83,9 +83,7 @@ def print_project(p: dict, verbose: bool = False, children: list = None):
         print(f"  Parent  : {parent_name}")
     print(f"  Path    : {cwd}")
     print(f"  Model   : {fmt_model(model) or '--'}")
-    active_minutes = p.get("project_active_minutes") or sum(
-        s.get("active_minutes", 0) for s in p.get("sessions", {}).values()
-    )
+    active_minutes = p.get("project_active_minutes", 0)
     active_hours = active_minutes / 60
     if active_hours >= 1:
         time_display = f"{active_hours:.1f} hr"

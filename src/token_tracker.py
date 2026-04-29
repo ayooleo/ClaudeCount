@@ -561,12 +561,16 @@ def _render_proj_segment(proj: dict, label: str = "Proj", extra_parts: list = No
     proj_turns = proj.get("turn_count", 0)
     if proj_turns:
         parts.append(f"{_GRY}{proj_turns} turns{_R}")
-    proj_total_hr = round(proj.get("active_minutes", 0) / 60) if proj.get("active_minutes", 0) else 0
-    if proj_total_hr >= 24:
-        d, h = divmod(proj_total_hr, 24)
-        parts.append(f"{_GRY}{d}d {h}hr{_R}" if h else f"{_GRY}{d}d{_R}")
-    elif proj_total_hr >= 1:
-        parts.append(f"{_GRY}{proj_total_hr}hr{_R}")
+    active_min = int(proj.get("active_minutes") or 0)
+    if active_min:
+        proj_total_hr = round(active_min / 60)
+        if proj_total_hr >= 24:
+            d, h = divmod(proj_total_hr, 24)
+            parts.append(f"{_GRY}{d}d {h}hr{_R}" if h else f"{_GRY}{d}d{_R}")
+        elif proj_total_hr >= 1:
+            parts.append(f"{_GRY}{proj_total_hr}hr{_R}")
+        else:
+            parts.append(f"{_GRY}{active_min} min{_R}")
     if extra_parts:
         parts.extend(extra_parts)
     return f"{_BLU}{label}{_GRY}: {_R}{_fmt_cost(proj.get('cost', 0))} {_parens(*parts)}"
@@ -852,36 +856,6 @@ def _scan_children(parent_pid: str) -> list:
     return children
 
 
-def _family_proj_segment(parent_project: dict, children: list) -> dict:
-    """Build status['project']: parent's own totals + every child's totals.
-    Children with cost == 0 contribute zero to every field, so filtering them
-    is unnecessary at the math level — they only get hidden in display layers."""
-    cost      = parent_project.get("project_total_cost", 0)
-    sess      = parent_project.get("session_count", 0)
-    turns     = parent_project.get("project_total_turns", 0)
-    active    = parent_project.get("project_active_minutes", 0)
-    pt = parent_project.get("project_total_tokens", {})
-    inp, cc, cr, out = (pt.get(k, 0) for k in
-                        ("input_tokens", "cache_creation_input_tokens",
-                         "cache_read_input_tokens", "output_tokens"))
-    for c in children:
-        cost   += c.get("project_total_cost", 0)
-        sess   += c.get("session_count", 0)
-        turns  += c.get("project_total_turns", 0)
-        active += c.get("project_active_minutes", 0)
-        ct = c.get("project_total_tokens", {})
-        inp += ct.get("input_tokens", 0)
-        cc  += ct.get("cache_creation_input_tokens", 0)
-        cr  += ct.get("cache_read_input_tokens", 0)
-        out += ct.get("output_tokens", 0)
-    return {
-        "cost": cost, "session_count": sess, "turn_count": turns,
-        "active_minutes": active,
-        "input_tokens": inp, "cache_creation": cc,
-        "cache_read": cr, "output_tokens": out,
-    }
-
-
 def _own_proj_segment(project: dict) -> dict:
     """Single-project view, used when this project has no children."""
     pt = project.get("project_total_tokens", {})
@@ -912,7 +886,7 @@ def _refresh_parent_status(parent_pid: str):
         parent_project = json.loads(parent_proj_file.read_text(encoding="utf-8"))
         children = _scan_children(parent_pid)
         own = _own_proj_segment(parent_project)
-        family = _family_proj_segment(parent_project, children) if children else own
+        family = _live_family_totals(own, children) if children else own
         status = json.loads(parent_status_file.read_text(encoding="utf-8"))
         status["project"] = family
         status["project_own"] = own
@@ -1332,6 +1306,8 @@ def main():
 
     save_project_data(DATA_DIR, pid, project)
 
+    own_seg = _own_proj_segment(project)
+    own_children = _scan_children(pid)
     status = {
         "project_name": Path(cwd).name,
         "cwd": cwd,
@@ -1356,10 +1332,8 @@ def main():
             "active_minutes": active_minutes,
             "turn_count": turn_count,
         },
-        # Proj segment: family aggregate when this project has children,
-        # otherwise own totals. Children's data is summed at write-time so
-        # render_mode stays a fast read.
-        "project": _own_proj_segment(project),
+        "project": _live_family_totals(own_seg, own_children) if own_children else own_seg,
+        "project_own": own_seg,
         "context": {
             "tokens": context_tokens,
             "window_size": ctx_win_size,
@@ -1368,16 +1342,6 @@ def main():
         "updated": datetime.now(timezone.utc).isoformat(),
     }
     _attach_parent(status, project)
-
-    # Always store the parent's *own* totals separately so the renderer can
-    # compute Self / Sub / Total breakdown without an extra disk read.
-    status["project_own"] = _own_proj_segment(project)
-
-    # If this project has children, replace the main project field with the
-    # family aggregate (own + all children).
-    own_children = _scan_children(pid)
-    if own_children:
-        status["project"] = _family_proj_segment(project, own_children)
 
     status_json = json.dumps(status, ensure_ascii=False)
     (STATUS_DIR / f"{pid}.json").write_text(status_json, encoding="utf-8")
