@@ -73,12 +73,19 @@ settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False))
 print("  ✓ ~/.claude/settings.json updated")
 PYEOF
 
+VERSION=$(python3 "$HOOKS_DIR/token_tracker.py" --version 2>/dev/null | awk '{print $2}')
 echo ""
-echo "✓ ClaudeCount installed! Restart Claude Code to activate."
+echo "✓ ClaudeCount ${VERSION:-installed}! Restart Claude Code to activate."
 echo ""
-echo "  Status bar shows: PROJECT │ Turn │ Sess │ Proj"
+echo "  Status bar shows: PROJECT 🌡️ ctx% ⚡ hit% │ Turn │ Sess │ Proj"
 echo ""
 echo "  Detailed report:"
 echo "    python3 ~/.claude/hooks/token_report.py           # current project"
 echo "    python3 ~/.claude/hooks/token_report.py --all     # all projects"
 echo "    python3 ~/.claude/hooks/token_report.py --all -v  # verbose"
+echo ""
+echo "  Adopt sessions that pre-date ClaudeCount:"
+echo "    python3 ~/.claude/hooks/token_tracker.py --import"
+echo ""
+echo "  Link a sub-project under its parent:"
+echo "    python3 ~/.claude/hooks/token_tracker.py --set-parent /path/to/parent"

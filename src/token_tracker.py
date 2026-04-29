@@ -8,6 +8,8 @@ import hashlib
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
+__version__ = "1.1.0"
+
 BASE_DIR   = Path.home() / ".claude" / "token_usage"
 STATUS_DIR = BASE_DIR / "status"
 DATA_DIR   = BASE_DIR / "projects"
@@ -33,13 +35,13 @@ def _is_assistant(msg: dict) -> bool:
     return ((msg.get("role") or msg.get("type")) == "assistant"
             or msg.get("message", {}).get("role") == "assistant")
 
-# Per-million-token rates and per-model metadata. Verified 2026-04-26 against
+# Per-million-token rates and per-model metadata. Verified 2026-04-29 against
+# https://platform.claude.com/docs/en/about-claude/models/overview and
 # https://platform.claude.com/docs/en/about-claude/pricing.
 #   cache_write_5m = ephemeral 5-min tier (1.25× input)
 #   cache_write_1h = ephemeral 1-hr tier   (2×    input)
 #   cache_read     =                       (0.1×  input)
-# context = 1M only for Opus 4.7 / 4.6 / Sonnet 4.6 (standard pricing across the
-# full window). All other current models default to 200K.
+# 1M context: Opus 4.7 / 4.6, Sonnet 4.6. All other models 200K.
 MODELS = {
     # Claude 4 family
     "claude-opus-4-7":   {"input":  5.00, "output": 25.00, "cache_write_5m":  6.25, "cache_write_1h": 10.00, "cache_read": 0.50, "context": 1_000_000, "name": "Opus 4.7"},
@@ -47,11 +49,13 @@ MODELS = {
     "claude-opus-4-5":   {"input":  5.00, "output": 25.00, "cache_write_5m":  6.25, "cache_write_1h": 10.00, "cache_read": 0.50, "context":   200_000, "name": "Opus 4.5"},
     "claude-opus-4-1":   {"input": 15.00, "output": 75.00, "cache_write_5m": 18.75, "cache_write_1h": 30.00, "cache_read": 1.50, "context":   200_000, "name": "Opus 4.1"},
     "claude-opus-4":     {"input": 15.00, "output": 75.00, "cache_write_5m": 18.75, "cache_write_1h": 30.00, "cache_read": 1.50, "context":   200_000, "name": "Opus 4"},
-    "claude-sonnet-4-6": {"input":  3.00, "output": 15.00, "cache_write_5m":  3.75, "cache_write_1h":  6.00, "cache_read": 0.30, "context":   200_000, "name": "Sonnet 4.6"},
+    "claude-sonnet-4-6": {"input":  3.00, "output": 15.00, "cache_write_5m":  3.75, "cache_write_1h":  6.00, "cache_read": 0.30, "context": 1_000_000, "name": "Sonnet 4.6"},
     "claude-sonnet-4-5": {"input":  3.00, "output": 15.00, "cache_write_5m":  3.75, "cache_write_1h":  6.00, "cache_read": 0.30, "context":   200_000, "name": "Sonnet 4.5"},
     "claude-sonnet-4":   {"input":  3.00, "output": 15.00, "cache_write_5m":  3.75, "cache_write_1h":  6.00, "cache_read": 0.30, "context":   200_000, "name": "Sonnet 4"},
     "claude-haiku-4-5":  {"input":  1.00, "output":  5.00, "cache_write_5m":  1.25, "cache_write_1h":  2.00, "cache_read": 0.10, "context":   200_000, "name": "Haiku 4.5"},
-    # Claude 3.x family (3.7 / 3.5 sonnet are deprecated but still callable)
+    # Claude 3.x family — kept for historical session pricing.
+    # 3.7-sonnet deprecated; 3.5-sonnet / 3-sonnet no longer on official model list
+    # but retained here so old transcripts reprice correctly.
     "claude-3-7-sonnet": {"input":  3.00, "output": 15.00, "cache_write_5m":  3.75, "cache_write_1h":  6.00, "cache_read": 0.30, "context":   200_000, "name": "Sonnet 3.7"},
     "claude-3-5-sonnet": {"input":  3.00, "output": 15.00, "cache_write_5m":  3.75, "cache_write_1h":  6.00, "cache_read": 0.30, "context":   200_000, "name": "Sonnet 3.5"},
     "claude-3-5-haiku":  {"input":  0.80, "output":  4.00, "cache_write_5m":  1.00, "cache_write_1h":  1.60, "cache_read": 0.08, "context":   200_000, "name": "Haiku 3.5"},
@@ -317,6 +321,78 @@ def save_project_data(data_dir: Path, pid: str, data: dict):
     f.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _legacy_view(project: dict) -> dict:
+    """Return project['legacy'], migrating an old `benchmark` field on first read.
+    The `benchmark` field is kept alongside as audit redundancy — users can drop it manually."""
+    legacy = project.get("legacy")
+    if legacy is None:
+        bench = project.get("benchmark")
+        if isinstance(bench, dict):
+            legacy = dict(bench)
+            project["legacy"] = legacy
+    return legacy or {}
+
+
+def _legacy_period_dates(legacy: dict) -> set:
+    """Inclusive ISO-date set for legacy.period_start..period_end, or empty if missing/malformed."""
+    ps, pe = legacy.get("period_start"), legacy.get("period_end")
+    if not (ps and pe):
+        return set()
+    try:
+        d1 = datetime.fromisoformat(ps.replace("Z", "+00:00")).date()
+        d2 = datetime.fromisoformat(pe.replace("Z", "+00:00")).date()
+    except Exception:
+        return set()
+    out = set()
+    cur = d1
+    while cur <= d2:
+        out.add(cur.isoformat())
+        cur += timedelta(days=1)
+    return out
+
+
+def recompute_project_totals(project: dict) -> None:
+    """Recompute project_total_* / session_count / active_days / etc. from sessions,
+    then merge `legacy` (if present). Idempotent — safe to call any time."""
+    all_sessions = list(project.get("sessions", {}).values())
+    project["project_total_cost"] = sum(s.get("cost", 0) for s in all_sessions)
+    project["project_total_tokens"] = {
+        k: sum(s.get("tokens", {}).get(k, 0) for s in all_sessions)
+        for k in ("input_tokens", "output_tokens",
+                  "cache_creation_input_tokens", "cache_read_input_tokens")
+    }
+    project["session_count"] = len(all_sessions)
+    session_dates = {
+        (s.get("started") or s.get("updated", ""))[:10]
+        for s in all_sessions
+        if (s.get("started") or s.get("updated", ""))
+    }
+    project["active_days"] = len(session_dates)
+    project["project_active_minutes"] = sum(s.get("active_minutes", 0) for s in all_sessions)
+    project["project_total_turns"] = sum(s.get("turn_count", 0) for s in all_sessions)
+
+    legacy = _legacy_view(project)
+    if not legacy:
+        return
+
+    project["project_total_cost"] += float(legacy.get("cost_usd", 0))
+    ltoks = legacy.get("tokens", {})
+    for k in project["project_total_tokens"]:
+        project["project_total_tokens"][k] += int(ltoks.get(k, 0))
+
+    project["session_count"] += int(
+        legacy.get("session_count") or len(legacy.get("session_ids", []))
+    )
+    project["project_active_minutes"] += int(legacy.get("active_minutes", 0))
+    project["project_total_turns"] += int(legacy.get("turn_count", 0))
+
+    legacy_dates = _legacy_period_dates(legacy)
+    if legacy_dates:
+        project["active_days"] = len(session_dates | legacy_dates)
+    elif "active_days" in legacy:
+        project["active_days"] += int(legacy["active_days"])
+
+
 def load_project_config(cwd: str) -> dict:
     """Load per-project config for custom pricing or disabling tracking."""
     for config_path in [
@@ -339,6 +415,7 @@ _YLW  = "\033[38;5;220m"
 _GRN  = "\033[38;5;120m"
 _BLU  = "\033[38;5;111m"
 _GRY  = "\033[38;5;183m"
+_DIM  = "\033[38;5;242m"   # darker neutral gray — secondary / auxiliary stats
 _RED  = "\033[38;5;203m"
 _SEP  = f"{_GRY} │ {_R}"
 
@@ -371,6 +448,23 @@ def _parens(*parts) -> str:
     return f"{_GRY}({_R}" + f"{_GRY}, {_R}".join(parts) + f"{_GRY}){_R}"
 
 
+def _cache_hit_rate(sess: dict):
+    """(pct, color) for session-level cache hit rate, or (None, None) if no input.
+    Definition matches industry convention: cache_read / (input + cache_creation + cache_read).
+    Color tiers are inverted from context-window pressure — high hit rate is *good*."""
+    total_in = (sess.get("input_tokens", 0)
+                + sess.get("cache_creation", 0)
+                + sess.get("cache_read", 0))
+    if total_in <= 0:
+        return None, None
+    pct = round(sess.get("cache_read", 0) / total_in * 100)
+    color = (_GRN if pct >= 90 else
+             _BLU if pct >= 75 else
+             _YLW if pct >= 50 else
+             _ORG)
+    return pct, color
+
+
 def _tok_triplet(d: dict) -> str:
     """`↑<total_in> ↓<out>[ <cache_read> «]` — shared by Turn/Sess/Proj segments.
     ↑↓ are prefix; « ('rewind') is suffix on the cache-read portion of ↑ — semantically
@@ -384,7 +478,12 @@ def _tok_triplet(d: dict) -> str:
 def _render_header(status: dict) -> str:
     name = (status.get("project_name") or status.get("cwd", "").split("/")[-1] or "PROJ").upper()
     model = fmt_model(status.get("model", ""))
-    header = f"{_BOLD}{_ORG}{name}{_R}"
+    parent_name = status.get("parent_name", "")
+    if parent_name:
+        # Sub-project: dim parent prefix + breadcrumb chevron + bright child name.
+        header = f"{_GRY}{parent_name}{_R} {_GRY}›{_R} {_BOLD}{_ORG}{name}{_R}"
+    else:
+        header = f"{_BOLD}{_ORG}{name}{_R}"
     if not model:
         return header
     ctx          = status.get("context", {})
@@ -396,10 +495,12 @@ def _render_header(status: dict) -> str:
              _YLW if ctx_pct >= 75 else
              _BLU if ctx_pct >= 50 else
              _GRN)
-        cw_str = f" {c}{ctx_pct}%{_R}"
+        cw_str = f" 🌡️ {c}{ctx_pct}%{_R}"
     else:
         cw_str = ""
-    return header + f" {_GRY}{model}{_R}{win_str}{cw_str}"
+    hit_pct, hit_color = _cache_hit_rate(status.get("session", {}))
+    hit_str = f" 🎯 {hit_color}{hit_pct}%{_R}" if hit_pct is not None else ""
+    return header + f" {_GRY}{model}{_R}{win_str}{cw_str}{hit_str}"
 
 
 def _render_turn_segment(t: dict) -> str:
@@ -418,7 +519,44 @@ def _render_sess_segment(sess: dict) -> str:
     return f"{_BLU}Sess{_GRY}: {_R}{_fmt_cost(sess.get('cost', 0))} {_parens(*parts)}"
 
 
-def _render_proj_segment(proj: dict) -> str:
+def _live_family_totals(own: dict, children: list) -> dict:
+    """Build a family aggregate proj-segment dict from live child project files.
+    Uses ALL children (not just visible) so session/turn counts are complete.
+    Zero-cost children contribute 0 to cost but may have sessions/turns."""
+    tk = lambda c, k: c.get("project_total_tokens", {}).get(k, 0)
+    return {
+        "cost":           own.get("cost", 0)           + sum(c.get("project_total_cost", 0) for c in children),
+        "session_count":  own.get("session_count", 0)  + sum(c.get("session_count", 0) for c in children),
+        "turn_count":     own.get("turn_count", 0)     + sum(c.get("project_total_turns", 0) for c in children),
+        "active_minutes": own.get("active_minutes", 0) + sum(c.get("project_active_minutes", 0) for c in children),
+        "input_tokens":   own.get("input_tokens", 0)   + sum(tk(c, "input_tokens") for c in children),
+        "cache_creation": own.get("cache_creation", 0) + sum(tk(c, "cache_creation_input_tokens") for c in children),
+        "cache_read":     own.get("cache_read", 0)     + sum(tk(c, "cache_read_input_tokens") for c in children),
+        "output_tokens":  own.get("output_tokens", 0)  + sum(tk(c, "output_tokens") for c in children),
+    }
+
+
+def _render_child_row(child_project: dict) -> str:
+    """Compact status-bar row rendered below the parent line.
+    Shows only the child's own aggregate — no 🌡️/🎯 (those are per-session
+    metrics for the active parent session, not the child)."""
+    name = child_project.get("name") or child_project.get("pid", "?")
+    pt = child_project.get("project_total_tokens", {})
+    proj_dict = {
+        "cost": child_project.get("project_total_cost", 0),
+        "session_count": child_project.get("session_count", 0),
+        "turn_count": child_project.get("project_total_turns", 0),
+        "active_minutes": child_project.get("project_active_minutes", 0),
+        "input_tokens":   pt.get("input_tokens", 0),
+        "cache_creation": pt.get("cache_creation_input_tokens", 0),
+        "cache_read":     pt.get("cache_read_input_tokens", 0),
+        "output_tokens":  pt.get("output_tokens", 0),
+    }
+    seg = _render_proj_segment(proj_dict, "Sub")
+    return f"  {_GRY}›{_R} {_GRY}{name}{_R}  {seg}"
+
+
+def _render_proj_segment(proj: dict, label: str = "Proj", extra_parts: list = None) -> str:
     parts = [_tok_triplet(proj), f"{_GRY}{proj.get('session_count', 0)} sess{_R}"]
     proj_turns = proj.get("turn_count", 0)
     if proj_turns:
@@ -429,15 +567,61 @@ def _render_proj_segment(proj: dict) -> str:
         parts.append(f"{_GRY}{d}d {h}hr{_R}" if h else f"{_GRY}{d}d{_R}")
     elif proj_total_hr >= 1:
         parts.append(f"{_GRY}{proj_total_hr}hr{_R}")
-    return f"{_BLU}Proj{_GRY}: {_R}{_fmt_cost(proj.get('cost', 0))} {_parens(*parts)}"
+    if extra_parts:
+        parts.extend(extra_parts)
+    return f"{_BLU}{label}{_GRY}: {_R}{_fmt_cost(proj.get('cost', 0))} {_parens(*parts)}"
 
 
 def render_status_line(status: dict) -> str:
+    """Render the status bar. Output varies by project role:
+
+    Standalone / child  →  single line (existing behaviour).
+
+    Parent with ≥1 cost>0 child  →  multi-line:
+      LINE 1: HEADER 🌡️ 🎯 │ Turn │ Sess │ Self: $own │ Sub: $children │ Total: $family (full params)
+      LINE 2+: one compact child row per cost>0 child, sorted by cost desc.
+
+    Self / Sub are cost-only (no token details).
+    Total reuses the full Proj segment format (token triplet, sess, turns, time).
+    project_own must be present in status for the Self/Sub split; if absent (legacy
+    status file not yet refreshed), falls back to the plain Proj label.
+    """
+    is_child = bool(status.get("parent_name"))
+    pid = status.get("pid")
+
+    all_children = []
+    visible_children = []
+    if not is_child and pid:
+        all_children = _scan_children(pid)
+        visible_children = sorted(
+            [c for c in all_children if c.get("project_total_cost", 0) > 0],
+            key=lambda c: c.get("project_total_cost", 0),
+            reverse=True,
+        )
+
+    header   = _render_header(status)
+    turn_seg = _render_turn_segment(status.get("last_turn", {}))
+    sess_seg = _render_sess_segment(status.get("session", {}))
+
+    if visible_children and "project_own" in status:
+        own = status["project_own"]
+        sub_cost   = sum(c.get("project_total_cost", 0) for c in all_children)
+        live_total = _live_family_totals(own, all_children)
+        # self / sub are metadata appended inside Proj's parenthetical,
+        # not separated by │ — they're stats of the same Proj segment.
+        extra = [
+            f"{_GRY}self ${own.get('cost', 0):.2f}{_R}",
+            f"{_GRY}sub ${sub_cost:.2f}{_R}",
+        ]
+        proj_seg = _render_proj_segment(live_total, "Proj", extra)
+        line1 = _SEP.join([header, turn_seg, sess_seg, proj_seg])
+        child_lines = [_render_child_row(c) for c in visible_children]
+        return line1 + "\n" + "\n".join(child_lines)
+
+    proj_label = "Sub" if is_child else "Proj"
     return _SEP.join([
-        _render_header(status),
-        _render_turn_segment(status.get("last_turn", {})),
-        _render_sess_segment(status.get("session", {})),
-        _render_proj_segment(status.get("project", {})),
+        header, turn_seg, sess_seg,
+        _render_proj_segment(status.get("project", {}), proj_label),
     ])
 
 
@@ -477,6 +661,14 @@ def _reset_session_state(session_id: str, cwd: str, model_hint: str = ""):
         "turn_count": 0,
     }
     status["context"] = {"tokens": 0, "window_size": live_win_size, "pct": 0}
+
+    # Refresh parent_pid / parent_name from project file in case the link
+    # changed since this status was last written.
+    try:
+        project = json.loads((DATA_DIR / f"{pid}.json").read_text(encoding="utf-8"))
+        _attach_parent(status, project)
+    except Exception:
+        pass
 
     status_json = json.dumps(status, ensure_ascii=False)
     status_file.write_text(status_json, encoding="utf-8")
@@ -639,13 +831,398 @@ def backfill_mode():
             proj_changed = True
             backfilled += 1
         if proj_changed:
-            data["project_total_turns"] = sum(s.get("turn_count", 0) for s in sessions.values())
-            data["project_active_minutes"] = sum(s.get("active_minutes", 0) for s in sessions.values())
+            recompute_project_totals(data)
             save_project_data(DATA_DIR, data["pid"], data)
     print(f"backfilled {backfilled} session(s)")
 
 
+def _scan_children(parent_pid: str) -> list:
+    """Return all project dicts whose parent_pid matches. Disk-scoped scan; cheap
+    enough at write-time (typical project counts < 100, files small)."""
+    children = []
+    if not parent_pid or not DATA_DIR.exists():
+        return children
+    for f in DATA_DIR.glob("*.json"):
+        try:
+            other = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if other.get("parent_pid") == parent_pid and other.get("pid") != parent_pid:
+            children.append(other)
+    return children
+
+
+def _family_proj_segment(parent_project: dict, children: list) -> dict:
+    """Build status['project']: parent's own totals + every child's totals.
+    Children with cost == 0 contribute zero to every field, so filtering them
+    is unnecessary at the math level — they only get hidden in display layers."""
+    cost      = parent_project.get("project_total_cost", 0)
+    sess      = parent_project.get("session_count", 0)
+    turns     = parent_project.get("project_total_turns", 0)
+    active    = parent_project.get("project_active_minutes", 0)
+    pt = parent_project.get("project_total_tokens", {})
+    inp, cc, cr, out = (pt.get(k, 0) for k in
+                        ("input_tokens", "cache_creation_input_tokens",
+                         "cache_read_input_tokens", "output_tokens"))
+    for c in children:
+        cost   += c.get("project_total_cost", 0)
+        sess   += c.get("session_count", 0)
+        turns  += c.get("project_total_turns", 0)
+        active += c.get("project_active_minutes", 0)
+        ct = c.get("project_total_tokens", {})
+        inp += ct.get("input_tokens", 0)
+        cc  += ct.get("cache_creation_input_tokens", 0)
+        cr  += ct.get("cache_read_input_tokens", 0)
+        out += ct.get("output_tokens", 0)
+    return {
+        "cost": cost, "session_count": sess, "turn_count": turns,
+        "active_minutes": active,
+        "input_tokens": inp, "cache_creation": cc,
+        "cache_read": cr, "output_tokens": out,
+    }
+
+
+def _own_proj_segment(project: dict) -> dict:
+    """Single-project view, used when this project has no children."""
+    pt = project.get("project_total_tokens", {})
+    return {
+        "cost": project.get("project_total_cost", 0),
+        "session_count": project.get("session_count", 0),
+        "turn_count": project.get("project_total_turns", 0),
+        "active_minutes": project.get("project_active_minutes", 0),
+        "input_tokens":  pt.get("input_tokens", 0),
+        "cache_creation": pt.get("cache_creation_input_tokens", 0),
+        "cache_read":    pt.get("cache_read_input_tokens", 0),
+        "output_tokens": pt.get("output_tokens", 0),
+    }
+
+
+def _refresh_parent_status(parent_pid: str):
+    """Re-aggregate family totals into the parent's status file. Called from a
+    child's Stop hook (and from --set-parent / --unset-parent) so the parent's
+    status bar reflects fresh family numbers without having to fire its own
+    Stop hook first. No-op if parent's status / project files don't exist."""
+    if not parent_pid:
+        return
+    parent_proj_file   = DATA_DIR / f"{parent_pid}.json"
+    parent_status_file = STATUS_DIR / f"{parent_pid}.json"
+    if not parent_proj_file.exists() or not parent_status_file.exists():
+        return
+    try:
+        parent_project = json.loads(parent_proj_file.read_text(encoding="utf-8"))
+        children = _scan_children(parent_pid)
+        own = _own_proj_segment(parent_project)
+        family = _family_proj_segment(parent_project, children) if children else own
+        status = json.loads(parent_status_file.read_text(encoding="utf-8"))
+        status["project"] = family
+        status["project_own"] = own
+        parent_status_file.write_text(json.dumps(status, ensure_ascii=False),
+                                      encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _attach_parent(status: dict, project: dict):
+    """Copy parent_pid / parent_name from a project file into a status payload.
+    Renames propagate on next update — staleness is harmless cosmetic."""
+    parent_pid = project.get("parent_pid")
+    if parent_pid:
+        status["parent_pid"] = parent_pid
+        status["parent_name"] = project.get("parent_name", "")
+    else:
+        status.pop("parent_pid", None)
+        status.pop("parent_name", None)
+
+
+def set_parent_mode(argv: list):
+    """Explicit, user-driven sub-project link: mark `child` as a sub-project of
+    `parent`. Both must already exist as ClaudeCount projects (i.e. have run at
+    least one Stop hook). Single-level only — a parent cannot itself have a
+    parent. Idempotent.
+
+    Usage:
+      --set-parent <parent_path>             # child defaults to cwd
+      --set-parent <parent_path> <child_path>
+    """
+    if not argv:
+        print("usage: --set-parent <parent_path> [child_path]")
+        return
+    parent_cwd = os.path.abspath(argv[0])
+    child_cwd  = os.path.abspath(argv[1] if len(argv) > 1 else os.getcwd())
+    parent_pid = project_id(parent_cwd)
+    child_pid  = project_id(child_cwd)
+
+    if parent_pid == child_pid:
+        print(f"refusing to link a project to itself ({parent_cwd})")
+        return
+
+    parent_file = DATA_DIR / f"{parent_pid}.json"
+    child_file  = DATA_DIR / f"{child_pid}.json"
+    if not parent_file.exists():
+        print(f"parent has no ClaudeCount data yet: {parent_cwd}")
+        return
+
+    parent = json.loads(parent_file.read_text(encoding="utf-8"))
+    if child_file.exists():
+        child = json.loads(child_file.read_text(encoding="utf-8"))
+    else:
+        # Pre-link: materialize an empty project file so future Stop hooks
+        # find an existing record (and inherit the parent link).
+        child = {
+            "pid": child_pid,
+            "name": Path(child_cwd).name,
+            "cwd": child_cwd,
+            "created": datetime.now(timezone.utc).isoformat(),
+            "sessions": {},
+        }
+        recompute_project_totals(child)
+        print(f"created empty project record for {child['name']} (no sessions yet)")
+
+    if parent.get("parent_pid"):
+        print(f"refusing to link under '{parent.get('name')}' — it is already a "
+              f"sub-project of '{parent.get('parent_name')}'. Single-level only.")
+        return
+
+    child["parent_pid"]  = parent_pid
+    child["parent_name"] = parent.get("name", "")
+    save_project_data(DATA_DIR, child_pid, child)
+
+    # Mirror into status so the next render shows the parent prefix immediately.
+    status_file = STATUS_DIR / f"{child_pid}.json"
+    if status_file.exists():
+        try:
+            status = json.loads(status_file.read_text(encoding="utf-8"))
+            _attach_parent(status, child)
+            status_file.write_text(json.dumps(status, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    # Re-aggregate the parent's family totals so the parent's status bar
+    # immediately reflects the new child without waiting for a Stop hook.
+    _refresh_parent_status(parent_pid)
+
+    print(f"linked '{child.get('name')}' → parent '{parent.get('name')}'")
+
+
+def unset_parent_mode(argv: list):
+    """Remove the parent link from a child project. Defaults to cwd."""
+    child_cwd = os.path.abspath(argv[0] if argv else os.getcwd())
+    child_pid = project_id(child_cwd)
+    child_file = DATA_DIR / f"{child_pid}.json"
+    if not child_file.exists():
+        print(f"no ClaudeCount data for {child_cwd}")
+        return
+    child = json.loads(child_file.read_text(encoding="utf-8"))
+    if not child.get("parent_pid"):
+        print(f"'{child.get('name')}' has no parent — nothing to unset")
+        return
+    prev = child.get("parent_name") or child.get("parent_pid")
+    ex_parent_pid = child.get("parent_pid")
+    child.pop("parent_pid", None)
+    child.pop("parent_name", None)
+    save_project_data(DATA_DIR, child_pid, child)
+
+    status_file = STATUS_DIR / f"{child_pid}.json"
+    if status_file.exists():
+        try:
+            status = json.loads(status_file.read_text(encoding="utf-8"))
+            status.pop("parent_pid", None)
+            status.pop("parent_name", None)
+            status_file.write_text(json.dumps(status, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    # Re-aggregate the ex-parent's family totals so its status bar drops this
+    # child immediately rather than waiting for its next Stop hook.
+    _refresh_parent_status(ex_parent_pid)
+
+    print(f"unlinked '{child.get('name')}' from parent '{prev}'")
+
+
+def merge_into_parent_mode(argv: list):
+    """Absorb a sub-project's history into its parent and delete the
+    sub-project record. **Destructive** — without `--yes`, prints an impact
+    preview and exits without writing. With `--yes`, performs:
+
+      1. merges every session in the child's `sessions` dict into the parent's
+         (collisions resolved by latest `updated`; merged entries get a
+         `merged_from` audit field)
+      2. recomputes parent totals
+      3. deletes the child's project file and status file
+      4. refreshes the parent's status (drops the child from family aggregate)
+
+    Refuses outright when the child carries a `legacy` block: that combines
+    with the parent's own legacy in non-trivial ways (potentially overlapping
+    period_start/end ranges, conflicting notes), so we leave it to the user
+    to consolidate manually rather than silently double-count or clobber.
+
+    Usage:
+      --merge-into-parent              # child = cwd, preview only
+      --merge-into-parent /path        # explicit child, preview only
+      --merge-into-parent --yes        # child = cwd, actually merge
+      --merge-into-parent /path --yes  # explicit child, actually merge
+    """
+    args = list(argv)
+    yes = ("--yes" in args) or ("-y" in args)
+    args = [a for a in args if a not in ("--yes", "-y")]
+    child_cwd = os.path.abspath(args[0] if args else os.getcwd())
+    child_pid = project_id(child_cwd)
+    child_file = DATA_DIR / f"{child_pid}.json"
+    if not child_file.exists():
+        print(f"no ClaudeCount data for {child_cwd}")
+        return
+
+    child = json.loads(child_file.read_text(encoding="utf-8"))
+    parent_pid = child.get("parent_pid")
+    if not parent_pid:
+        print(f"'{child.get('name')}' is not a sub-project — "
+              f"link it first with --set-parent before merging")
+        return
+
+    parent_file = DATA_DIR / f"{parent_pid}.json"
+    if not parent_file.exists():
+        print(f"parent project file missing (parent_pid={parent_pid}) — "
+              f"cannot merge; consider --unset-parent and removing the orphan")
+        return
+    parent = json.loads(parent_file.read_text(encoding="utf-8"))
+
+    if _legacy_view(child):
+        print(f"refusing to merge: child '{child.get('name')}' carries a `legacy` "
+              f"block (pre-ClaudeCount usage). Consolidate that into the parent's "
+              f"legacy block manually first, then re-run.")
+        return
+
+    child_sessions = child.get("sessions", {})
+
+    if not yes:
+        merged_sess  = parent.get("session_count", 0) + len(child_sessions)
+        merged_cost  = parent.get("project_total_cost", 0) + child.get("project_total_cost", 0)
+        merged_turns = parent.get("project_total_turns", 0) + child.get("project_total_turns", 0)
+        merged_min   = parent.get("project_active_minutes", 0) + child.get("project_active_minutes", 0)
+        print("=" * 60)
+        print("PREVIEW — no changes written. Re-run with --yes to apply.")
+        print("=" * 60)
+        print(f"  child  : {child.get('name')}  ({len(child_sessions)} sessions, "
+              f"${child.get('project_total_cost', 0):.2f}, "
+              f"{child.get('project_total_turns', 0)} turns, "
+              f"{child.get('project_active_minutes', 0)} min)")
+        print(f"  parent : {parent.get('name')}  ({parent.get('session_count', 0)} sessions, "
+              f"${parent.get('project_total_cost', 0):.2f}, "
+              f"{parent.get('project_total_turns', 0)} turns, "
+              f"{parent.get('project_active_minutes', 0)} min)")
+        print(f"  after  : {parent.get('name')}  ({merged_sess} sessions, "
+              f"${merged_cost:.2f}, {merged_turns} turns, {merged_min} min)")
+        print()
+        print(f"  child's project + status files will be DELETED. This cannot be undone.")
+        print(f"  re-run with --yes when ready.")
+        return
+
+    # Apply
+    parent_sessions = parent.setdefault("sessions", {})
+    collisions = []
+    for sid, s in child_sessions.items():
+        if sid in parent_sessions:
+            existing_updated = parent_sessions[sid].get("updated", "")
+            new_updated = s.get("updated", "")
+            if new_updated > existing_updated:
+                merged = dict(s)
+                merged["merged_from"] = child.get("name", child_pid)
+                parent_sessions[sid] = merged
+            collisions.append(sid)
+        else:
+            merged = dict(s)
+            merged["merged_from"] = child.get("name", child_pid)
+            parent_sessions[sid] = merged
+
+    recompute_project_totals(parent)
+    parent["last_updated"] = datetime.now(timezone.utc).isoformat()
+    save_project_data(DATA_DIR, parent_pid, parent)
+
+    child_file.unlink()
+    child_status = STATUS_DIR / f"{child_pid}.json"
+    if child_status.exists():
+        child_status.unlink()
+
+    _refresh_parent_status(parent_pid)
+
+    msg = (f"merged {len(child_sessions)} session(s) from '{child.get('name')}' "
+           f"into '{parent.get('name')}'; child project + status files deleted")
+    if collisions:
+        msg += f"; {len(collisions)} session-id collision(s) resolved by latest 'updated'"
+    print(msg)
+
+
+def import_mode(argv: list):
+    """Adopt sessions that pre-date ClaudeCount: scan
+    ~/.claude/projects/<encoded-cwd>/*.jsonl and import any session not yet in
+    projects/{pid}.json. Idempotent — already-tracked sessions are skipped.
+
+    Path defaults to the current working directory; pass `--import <path>` to
+    backfill a different project. Each session is reconstructed from its
+    transcript exactly the way the Stop hook would: tokens / cost / model /
+    started / active_minutes / turn_count, with per-message model used for
+    pricing so multi-model sessions reprice correctly.
+    """
+    cwd = os.path.abspath(argv[0] if argv else os.getcwd())
+    encoded = cwd.replace("/", "-")
+    transcripts_dir = Path.home() / ".claude" / "projects" / encoded
+    if not transcripts_dir.exists():
+        print(f"no Claude Code transcripts at {transcripts_dir}")
+        return
+
+    pid = project_id(cwd)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    project = load_project_data(DATA_DIR, pid)
+    project.setdefault("sessions", {})
+    project.setdefault("created", datetime.now(timezone.utc).isoformat())
+    project["name"] = Path(cwd).name
+    project["cwd"] = cwd
+
+    cfg = load_project_config(cwd)
+    price_override = cfg.get("pricing", None)
+
+    imported = skipped = empty = 0
+    last_model_seen = ""
+    for transcript in sorted(transcripts_dir.glob("*.jsonl")):
+        sid = transcript.stem
+        if sid in project["sessions"]:
+            skipped += 1
+            continue
+        msgs = read_transcript(str(transcript))
+        usages = get_all_assistant_usages(msgs) if msgs else []
+        if not usages:
+            empty += 1
+            continue
+        session_tokens, session_cost, model = sum_usages(usages, price_override)
+        if model:
+            last_model_seen = model
+        started = get_session_start(msgs) or datetime.now(timezone.utc).isoformat()
+        project["sessions"][sid] = {
+            "cost": session_cost,
+            "tokens": session_tokens,
+            "model": model,
+            "started": started,
+            "active_minutes": calc_active_minutes(msgs),
+            "turn_count": count_turns(msgs),
+            "updated": datetime.now(timezone.utc).isoformat(),
+            "imported": True,
+        }
+        imported += 1
+
+    if imported:
+        project["last_updated"] = datetime.now(timezone.utc).isoformat()
+        if not project.get("last_model") and last_model_seen:
+            project["last_model"] = last_model_seen
+        recompute_project_totals(project)
+        save_project_data(DATA_DIR, pid, project)
+    print(f"{Path(cwd).name}: imported {imported}, "
+          f"skipped {skipped} already-tracked, {empty} empty")
+
+
 def main():
+    if "--version" in sys.argv or "-V" in sys.argv:
+        print(f"ClaudeCount {__version__}")
+        return
     if "--render" in sys.argv:
         render_mode(sys.argv[sys.argv.index("--render") + 1:])
         return
@@ -657,6 +1234,24 @@ def main():
         return
     if "--backfill" in sys.argv:
         backfill_mode()
+        return
+    if "--import" in sys.argv:
+        import_mode(sys.argv[sys.argv.index("--import") + 1:])
+        return
+    if "--set-parent" in sys.argv:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        STATUS_DIR.mkdir(parents=True, exist_ok=True)
+        set_parent_mode(sys.argv[sys.argv.index("--set-parent") + 1:])
+        return
+    if "--unset-parent" in sys.argv:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        STATUS_DIR.mkdir(parents=True, exist_ok=True)
+        unset_parent_mode(sys.argv[sys.argv.index("--unset-parent") + 1:])
+        return
+    if "--merge-into-parent" in sys.argv:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        STATUS_DIR.mkdir(parents=True, exist_ok=True)
+        merge_into_parent_mode(sys.argv[sys.argv.index("--merge-into-parent") + 1:])
         return
 
     hook = _read_hook_input()
@@ -733,21 +1328,7 @@ def main():
         "updated": datetime.now(timezone.utc).isoformat(),
     }
 
-    all_sessions = list(project["sessions"].values())
-    project["project_total_cost"] = sum(s["cost"] for s in all_sessions)
-    project["project_total_tokens"] = {
-        k: sum(s["tokens"].get(k, 0) for s in all_sessions)
-        for k in ("input_tokens", "output_tokens",
-                  "cache_creation_input_tokens", "cache_read_input_tokens")
-    }
-    project["session_count"] = len(all_sessions)
-    project["active_days"] = len({
-        (s.get("started") or s.get("updated", ""))[:10]
-        for s in all_sessions
-        if (s.get("started") or s.get("updated", ""))
-    })
-    project["project_active_minutes"] = sum(s.get("active_minutes", 0) for s in all_sessions)
-    project["project_total_turns"] = sum(s.get("turn_count", 0) for s in all_sessions)
+    recompute_project_totals(project)
 
     save_project_data(DATA_DIR, pid, project)
 
@@ -775,16 +1356,10 @@ def main():
             "active_minutes": active_minutes,
             "turn_count": turn_count,
         },
-        "project": {
-            "cost": project["project_total_cost"],
-            "session_count": project["session_count"],
-            "turn_count": project["project_total_turns"],
-            "input_tokens": project["project_total_tokens"].get("input_tokens", 0),
-            "cache_creation": project["project_total_tokens"].get("cache_creation_input_tokens", 0),
-            "cache_read": project["project_total_tokens"].get("cache_read_input_tokens", 0),
-            "output_tokens": project["project_total_tokens"].get("output_tokens", 0),
-            "active_minutes": project["project_active_minutes"],
-        },
+        # Proj segment: family aggregate when this project has children,
+        # otherwise own totals. Children's data is summed at write-time so
+        # render_mode stays a fast read.
+        "project": _own_proj_segment(project),
         "context": {
             "tokens": context_tokens,
             "window_size": ctx_win_size,
@@ -792,10 +1367,27 @@ def main():
         },
         "updated": datetime.now(timezone.utc).isoformat(),
     }
+    _attach_parent(status, project)
+
+    # Always store the parent's *own* totals separately so the renderer can
+    # compute Self / Sub / Total breakdown without an extra disk read.
+    status["project_own"] = _own_proj_segment(project)
+
+    # If this project has children, replace the main project field with the
+    # family aggregate (own + all children).
+    own_children = _scan_children(pid)
+    if own_children:
+        status["project"] = _family_proj_segment(project, own_children)
 
     status_json = json.dumps(status, ensure_ascii=False)
     (STATUS_DIR / f"{pid}.json").write_text(status_json, encoding="utf-8")
     (STATUS_DIR / "current.json").write_text(status_json, encoding="utf-8")
+
+    # If this project is a child, propagate fresh family totals up to the
+    # parent's status so the parent's Proj segment stays current without
+    # needing its own Stop hook to also fire.
+    if project.get("parent_pid"):
+        _refresh_parent_status(project["parent_pid"])
 
 
 if __name__ == "__main__":
