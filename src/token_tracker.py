@@ -1119,10 +1119,13 @@ def merge_into_parent_mode(argv: list):
 
     _refresh_parent_status(parent_pid)
 
+    new_cost = parent.get("project_total_cost", 0)
+    new_sess = parent.get("session_count", 0)
     msg = (f"merged {len(child_sessions)} session(s) from '{child.get('name')}' "
-           f"into '{parent.get('name')}'; child project + status files deleted")
+           f"into '{parent.get('name')}'; child project + status files deleted\n"
+           f"parent new total: ${new_cost:.2f}, {new_sess} session(s)")
     if collisions:
-        msg += f"; {len(collisions)} session-id collision(s) resolved by latest 'updated'"
+        msg += f"\n{len(collisions)} session-id collision(s) resolved by latest 'updated'"
     print(msg)
 
 
